@@ -12,8 +12,8 @@
 #include <unistd.h>
 
 #define LOG_PATH "/home/working/ogotchi_log.txt"
-#define MAX_SSID 2048
-#define MAX_IP 512
+#define MAX_SSID 1024
+#define MAX_IP 256
 #define MAX_ROW 40
 
 enum { M_CUR, M_HAP, M_EXC, M_BOR, M_SUR, M_COO };
@@ -343,31 +343,55 @@ static const char *speak(void)
     return "Spectrum has secrets.";
 }
 
-static void bar(char *o, int n, float p)
+static void put(int y, int x, const char *s, int n, int attr)
 {
-    int i, k = (int)(p / 100.f * n + 0.5f);
+    int h, w, room;
+    getmaxyx(stdscr, h, w);
+    if (y < 0 || x < 0 || y >= h || x >= w || n <= 0)
+        return;
+    room = w - x - (y == h - 1 ? 1 : 0);
+    if (n > room)
+        n = room;
+    if (n <= 0)
+        return;
+    attron(attr);
+    mvaddnstr(y, x, s, n);
+    attroff(attr);
+}
+
+static void fill(int y, int x, int n, int attr)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        put(y, x + i, " ", 1, attr);
+}
+
+static void bar_at(int y, int x, int n, float p, int attr)
+{
+    char b[16];
+    int i, k;
+    if (n > 12)
+        n = 12;
+    k = (int)(p / 100.f * n + 0.5f);
     if (k < 0)
         k = 0;
     if (k > n)
         k = n;
     for (i = 0; i < n; i++)
-        o[i] = (char)(i < k ? '#' : '-');
-    o[n] = 0;
-}
-
-static void putbar(int y, const char *lab, float v)
-{
-    char b[12];
-    bar(b, 10, v);
-    mvprintw(y, 0, "%s %s %3.0f", lab, b, v);
+        b[i] = (char)(i < k ? '=' : '.');
+    b[n] = 0;
+    put(y, x, b, n, attr);
 }
 
 static int prompt(const char *title, char *out, size_t n)
 {
+    int h, w;
+    getmaxyx(stdscr, h, w);
     echo();
     curs_set(1);
-    mvprintw(LINES / 2, 2, "%s: ", title);
-    clrtoeol();
+    fill(h / 2, 0, w, COLOR_PAIR(2));
+    put(h / 2, 1, title, 8, COLOR_PAIR(2));
+    wmove(stdscr, h / 2, 10);
     out[0] = 0;
     wgetnstr(stdscr, out, (int)n - 1);
     noecho();
@@ -377,50 +401,70 @@ static int prompt(const char *title, char *out, size_t n)
 
 static void draw(void)
 {
-    int h, w, mid, list_h, i, y;
+    int h, w, mid, lw, rw, list0, list_h, i, y;
+    char buf[64];
     if (!dirty)
         return;
     getmaxyx(stdscr, h, w);
-    mid = w * 3 / 5;
-    if (mid < 24)
+    if (w < 20)
+        w = 20;
+    mid = w / 2;
+    if (mid < 16)
+        mid = 16;
+    if (mid > w - 10)
         mid = w / 2;
+    lw = mid;
+    rw = w - mid - 1;
+    if (rw < 8)
+        rw = 8;
+    list0 = 6;
+    list_h = h - list0 - 2;
+    if (list_h < 1)
+        list_h = 1;
+
     erase();
-    attron(A_REVERSE);
-    mvprintw(0, 0, "%-*s", w, "");
-    mvprintw(0, 1, "cGotchi %s  %s  %.1fd  auto%s", face(), moodn(), P.age_h / 24.f, P.auto_on ? "*" : "-");
-    attroff(A_REVERSE);
-    mvprintw(1, 1, "%s", P.name);
-    putbar(2, "bor", P.bor);
-    putbar(3, "exc", P.exc);
-    putbar(4, "en ", P.en);
-    mvprintw(5, 1, "scan %u  ssid %d  ip %d  wow %u", P.scans, nSsid, nIp, P.wow);
-    mvprintw(6, 1, "%s", speak());
-    mvprintw(7, 0, "scan");
-    mvprintw(7, mid + 1, "addr");
-    list_h = h - 10;
-    if (list_h < 3)
-        list_h = 3;
-    y = 8;
-    for (i = 0; i < nrows && i < list_h; i++) {
-        if (P.hide_open && (!strcmp(rows[i].sec, "Open") || !rows[i].sec[0]))
+    fill(0, 0, w, COLOR_PAIR(2));
+    snprintf(buf, sizeof buf, "cGotchi %s", face());
+    put(0, 1, buf, lw - 2, COLOR_PAIR(2));
+    snprintf(buf, sizeof buf, "%s %s", moodn(), P.auto_on ? "AUTO" : "");
+    put(0, mid + 1, buf, rw, COLOR_PAIR(2));
+
+    snprintf(buf, sizeof buf, "%s  %.1fd", P.name, P.age_h / 24.f);
+    put(1, 1, buf, w - 2, COLOR_PAIR(1));
+    put(2, 1, "bor", 3, COLOR_PAIR(1));
+    bar_at(2, 5, 8, P.bor, COLOR_PAIR(1));
+    put(3, 1, "exc", 3, COLOR_PAIR(1));
+    bar_at(3, 5, 8, P.exc, COLOR_PAIR(1));
+    put(4, 1, "en ", 3, COLOR_PAIR(1));
+    bar_at(4, 5, 8, P.en, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "n%d i%d s%u", nSsid, nIp, P.scans);
+    put(2, mid + 1, buf, rw, COLOR_PAIR(1));
+    put(3, mid + 1, speak(), rw, COLOR_PAIR(1));
+    put(5, 0, "AP", 2, COLOR_PAIR(2));
+    fill(5, 0, lw, COLOR_PAIR(2));
+    put(5, 1, "AP", 2, COLOR_PAIR(2));
+    fill(5, mid + 1, rw, COLOR_PAIR(2));
+    put(5, mid + 2, "IP", 2, COLOR_PAIR(2));
+
+    y = list0;
+    for (i = 0; i < nrows && y < list0 + list_h; i++) {
+        int attr = rows[i].is_new ? COLOR_PAIR(3) : COLOR_PAIR(1);
+        if (P.hide_open && (!rows[i].sec[0] || !strcmp(rows[i].sec, "Open")))
             continue;
-        mvprintw(y, 0, "%c%-14.14s %3d %-6.6s", rows[i].is_new ? '*' : ' ',
-                 rows[i].ssid, rows[i].sig, rows[i].sec);
-        y++;
-        if (y >= h - 2)
-            break;
+        snprintf(buf, sizeof buf, "%c%-10.10s %3d", rows[i].is_new ? '*' : ' ',
+                 rows[i].ssid, rows[i].sig);
+        put(y++, 0, buf, lw - 1, attr);
     }
-    y = 8;
-    for (i = 0; i < nIp && y < h - 2; i++) {
-        mvprintw(y, mid + 1, "%-18.18s", Ips[i].k);
-        y++;
-    }
-    if (0 < mid && mid < w)
-        mvvline(7, mid, ACS_VLINE, h - 9);
-    attron(A_REVERSE);
-    mvprintw(h - 2, 0, "%-*s", w, status[0] ? status : LOG_PATH);
-    mvprintw(h - 1, 0, "%-*s", w, "s scan  R rescan  a auto  n name  o open  q");
-    attroff(A_REVERSE);
+    y = list0;
+    for (i = 0; i < nIp && y < list0 + list_h; i++)
+        put(y++, mid + 1, Ips[i].k, rw, COLOR_PAIR(1));
+    for (y = list0; y < list0 + list_h; y++)
+        mvaddch(y, mid, ACS_VLINE | COLOR_PAIR(1));
+
+    fill(h - 2, 0, w, COLOR_PAIR(1));
+    put(h - 2, 1, status[0] ? status : LOG_PATH, w - 3, COLOR_PAIR(1));
+    fill(h - 1, 0, w, COLOR_PAIR(2));
+    put(h - 1, 1, "s look  R radio  a auto  n name  o open  q", w - 3, COLOR_PAIR(2));
     refresh();
     dirty = 0;
 }
@@ -438,13 +482,16 @@ int main(void)
     curs_set(0);
     if (has_colors()) {
         start_color();
-        use_default_colors();
+        init_pair(1, COLOR_GREEN, COLOR_BLACK);
+        init_pair(2, COLOR_BLACK, COLOR_GREEN);
+        init_pair(3, COLOR_YELLOW, COLOR_BLACK);
+        bkgd(COLOR_PAIR(1));
     }
-    snprintf(status, sizeof status, "s to look around");
+    snprintf(status, sizeof status, "s look  R radio");
     dirty = 1;
     draw();
     for (;;) {
-        int timeout = P.auto_on ? 25000 : 200;
+        int timeout = P.auto_on ? 25000 : 500;
         if (poll(&pfd, 1, timeout) > 0) {
             int k = getch();
             if (k == 'q' || k == 'Q')
