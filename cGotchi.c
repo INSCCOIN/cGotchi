@@ -12,8 +12,8 @@
 #include <unistd.h>
 
 #define LOG_PATH "/home/working/ogotchi_log.txt"
-#define MAX_SSID 1024
-#define MAX_IP 256
+#define MAX_SSID 2048
+#define MAX_IP 512
 #define MAX_ROW 40
 
 enum { M_CUR, M_HAP, M_EXC, M_BOR, M_SUR, M_COO };
