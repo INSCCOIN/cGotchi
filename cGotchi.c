@@ -1,252 +1,230 @@
-/* cGotchi — passive Wi-Fi companion for SharkDeck. libc only. */
+/* cGotchi — lightweight ncurses Wi-Fi companion. */
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <ncurses.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
-#define COLS 48
+#define LOG_PATH "/home/working/ogotchi_log.txt"
 #define MAX_SSID 1024
 #define MAX_IP 256
-#define LOG_PATH "/home/working/ogotchi_log.txt"
-#define SAVE_PATH_HOME ".cgotchi"
+#define MAX_ROW 40
 
-static const char *FACES[] = {
-    "(._.)", "(o_o)", "(^_^)", "(-_-)", "(O_O)", "(u_u)",
-};
-
-enum { M_CURIOUS, M_HAPPY, M_EXCITED, M_BORED, M_SURPRISED, M_COOL, M_N };
+enum { M_CUR, M_HAP, M_EXC, M_BOR, M_SUR, M_COO };
 
 typedef struct {
     char name[24];
     time_t born, last;
-    float age_h, boredom, excitement, energy;
-    int mood;
-    unsigned scans, seen, opens, wpa3, wow;
+    float age_h, bor, exc, en;
+    int mood, auto_on, hide_open;
+    unsigned scans, opens, wpa3, wow;
     int last_n, last_ok;
     char last_msg[40];
 } Pet;
 
 typedef struct {
-    char key[80];
+    char ssid[48], bssid[24], sec[20];
+    int sig, is_new;
+} Net;
+
+typedef struct {
+    char k[80];
 } Slot;
 
-static Pet pet;
-static Slot ssids[MAX_SSID];
-static int nssid;
-static Slot ips[MAX_IP];
-static int nip;
-static int autoscan;
-static struct termios oldt;
-static int raw_on;
+static Pet P;
+static Slot Ssid[MAX_SSID], Ips[MAX_IP];
+static int nSsid, nIp;
+static Net rows[MAX_ROW];
+static int nrows;
+static char status[80];
+static int dirty = 1;
 
-static unsigned hash_str(const char *s)
-{
-    unsigned h = 2166136261u;
-    while (*s)
-        h = (h ^ (unsigned char)*s++) * 16777619u;
-    return h;
-}
-
-static int seen_key(Slot *tab, int *n, int cap, const char *key)
+static int known(Slot *t, int *n, int cap, const char *k)
 {
     int i;
     for (i = 0; i < *n; i++)
-        if (!strcmp(tab[i].key, key))
+        if (!strcmp(t[i].k, k))
             return 1;
     if (*n >= cap)
         return 1;
-    snprintf(tab[*n].key, sizeof tab[0].key, "%s", key);
+    snprintf(t[*n].k, sizeof t[0].k, "%s", k);
     (*n)++;
-    (void)hash_str;
     return 0;
 }
 
-static void home_save(char *out, size_t n)
+static void save_path(char *b, size_t n)
 {
     const char *h = getenv("HOME");
-    snprintf(out, n, "%s/%s", h && *h ? h : ".", SAVE_PATH_HOME);
+    snprintf(b, n, "%s/.cgotchi", h && *h ? h : ".");
 }
 
 static void pet_default(void)
 {
-    memset(&pet, 0, sizeof pet);
-    snprintf(pet.name, sizeof pet.name, "Observer");
-    pet.born = pet.last = time(NULL);
-    pet.boredom = 20;
-    pet.excitement = 40;
-    pet.energy = 80;
-    pet.mood = M_CURIOUS;
-    pet.last_ok = 1;
+    memset(&P, 0, sizeof P);
+    snprintf(P.name, sizeof P.name, "Observer");
+    P.born = P.last = time(NULL);
+    P.bor = 20;
+    P.exc = 40;
+    P.en = 80;
+    P.mood = M_CUR;
+    P.last_ok = 1;
 }
 
 static void pet_save(void)
 {
     char path[256], tmp[280];
     FILE *f;
-    home_save(path, sizeof path);
+    save_path(path, sizeof path);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     f = fopen(tmp, "w");
     if (!f)
         return;
-    fprintf(f, "%s\n%ld %ld\n%.4f %.2f %.2f %.2f\n%d\n%u %u %u %u %u\n",
-            pet.name, (long)pet.born, (long)pet.last, pet.age_h,
-            pet.boredom, pet.excitement, pet.energy, pet.mood,
-            pet.scans, pet.seen, pet.opens, pet.wpa3, pet.wow);
+    fprintf(f, "%s\n%ld %ld\n%.3f %.1f %.1f %.1f\n%d %d\n%u %u %u %u\n",
+            P.name, (long)P.born, (long)P.last, P.age_h, P.bor, P.exc, P.en,
+            P.mood, P.auto_on, P.scans, P.opens, P.wpa3, P.wow);
     fclose(f);
     rename(tmp, path);
 }
 
 static void pet_load(void)
 {
-    char path[256], line[64];
+    char path[256];
     FILE *f;
     long b, l;
     pet_default();
-    home_save(path, sizeof path);
+    save_path(path, sizeof path);
     f = fopen(path, "r");
     if (!f)
         return;
-    if (!fgets(pet.name, sizeof pet.name, f)) {
+    if (!fgets(P.name, sizeof P.name, f)) {
         fclose(f);
         return;
     }
-    pet.name[strcspn(pet.name, "\n")] = 0;
+    P.name[strcspn(P.name, "\n")] = 0;
     if (fscanf(f, "%ld %ld", &b, &l) == 2) {
-        pet.born = (time_t)b;
-        pet.last = (time_t)l;
+        P.born = (time_t)b;
+        P.last = (time_t)l;
     }
-    fscanf(f, "%f %f %f %f", &pet.age_h, &pet.boredom, &pet.excitement, &pet.energy);
-    fscanf(f, "%d", &pet.mood);
-    fscanf(f, "%u %u %u %u %u", &pet.scans, &pet.seen, &pet.opens, &pet.wpa3, &pet.wow);
+    if (fscanf(f, "%f %f %f %f", &P.age_h, &P.bor, &P.exc, &P.en) != 4) {
+    }
+    if (fscanf(f, "%d %d", &P.mood, &P.auto_on) != 2)
+        P.mood = M_CUR;
+    if (fscanf(f, "%u %u %u %u", &P.scans, &P.opens, &P.wpa3, &P.wow) != 4) {
+    }
     fclose(f);
-    (void)line;
 }
 
-static void tick_time(void)
+static void tick(void)
 {
     time_t n = time(NULL);
-    float dh = (float)(n - pet.last) / 3600.f;
+    float dh = (float)(n - P.last) / 3600.f;
     if (dh < 0)
         dh = 0;
-    if (dh > 24)
-        dh = 24;
-    pet.age_h += dh;
-    pet.boredom = pet.boredom + dh * 8.f;
-    if (pet.boredom > 100)
-        pet.boredom = 100;
-    pet.excitement -= dh * 5.f;
-    if (pet.excitement < 0)
-        pet.excitement = 0;
-    pet.energy -= dh * 2.f;
-    if (pet.energy < 10)
-        pet.energy = 10;
-    pet.last = n;
+    if (dh > 12)
+        dh = 12;
+    P.age_h += dh;
+    P.bor += dh * 8.f;
+    if (P.bor > 100)
+        P.bor = 100;
+    P.exc -= dh * 5.f;
+    if (P.exc < 0)
+        P.exc = 0;
+    P.en -= dh * 2.f;
+    if (P.en < 10)
+        P.en = 10;
+    P.last = n;
 }
 
-static void log_init_dir(void)
-{
-    mkdir("/home/working", 0755);
-}
-
-static void log_append(const char *kind, const char *value, const char *extra)
+static void log_line(const char *kind, const char *val, const char *ex)
 {
     FILE *f;
+    char ts[32];
     time_t t = time(NULL);
     struct tm *tm = localtime(&t);
-    char ts[32];
-    log_init_dir();
+    mkdir("/home/working", 0755);
     f = fopen(LOG_PATH, "a");
     if (!f)
         return;
     strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", tm);
-    fprintf(f, "%s %s  %s  %s\n", ts, kind, value, extra ? extra : "");
+    fprintf(f, "%s %s  %s  %s\n", ts, kind, val, ex ? ex : "");
     fclose(f);
 }
 
 static void log_preload(void)
 {
     FILE *f;
-    char line[256], kind[16], val[80], extra[80];
+    char line[256], kind[16], val[80];
     f = fopen(LOG_PATH, "r");
     if (!f)
         return;
     while (fgets(line, sizeof line, f)) {
-        extra[0] = 0;
-        if (sscanf(line, "%*s %15s %79s %79[^\n]", kind, val, extra) < 2)
+        if (sscanf(line, "%*s %15s %79s", kind, val) < 2)
             continue;
         if (!strcmp(kind, "SSID"))
-            seen_key(ssids, &nssid, MAX_SSID, val);
+            known(Ssid, &nSsid, MAX_SSID, val);
         else if (!strcmp(kind, "IP"))
-            seen_key(ips, &nip, MAX_IP, val);
+            known(Ips, &nIp, MAX_IP, val);
     }
     fclose(f);
 }
 
-static int have_nmcli(void)
-{
-    return access("/usr/bin/nmcli", X_OK) == 0 || access("/bin/nmcli", X_OK) == 0;
-}
-
 static void capture_ips(void)
 {
-    FILE *p;
+    FILE *p = popen("ip -4 -o addr show 2>/dev/null", "r");
     char line[256];
-    p = popen("ip -4 -o addr show 2>/dev/null", "r");
     if (!p)
         return;
     while (fgets(line, sizeof line, p)) {
-        char iface[32] = "", ip[64] = "", extra[80];
-        char *slash;
+        char iface[32], ip[64], extra[80], *sl;
         if (sscanf(line, "%*d: %31s inet %63s", iface, ip) < 2)
             continue;
-        slash = strchr(ip, '/');
-        if (slash)
-            *slash = 0;
-        if (!seen_key(ips, &nip, MAX_IP, ip)) {
+        sl = strchr(ip, '/');
+        if (sl)
+            *sl = 0;
+        if (!known(Ips, &nIp, MAX_IP, ip)) {
             snprintf(extra, sizeof extra, "%s", iface);
-            log_append("IP", ip, extra);
+            log_line("IP", ip, extra);
         }
     }
     pclose(p);
 }
 
-static int scan_wifi(int *new_ssid, int *opens, int *wpa3)
+static int scan_wifi(int rescan)
 {
     FILE *p;
     char line[512];
-    int n = 0;
-    *new_ssid = *opens = *wpa3 = 0;
-    pet.last_ok = 1;
-    pet.last_msg[0] = 0;
-    if (!have_nmcli()) {
-        pet.last_ok = 0;
-        snprintf(pet.last_msg, sizeof pet.last_msg, "no nmcli");
+    int n = 0, neu = 0, op = 0, w3 = 0;
+    nrows = 0;
+    P.last_ok = 1;
+    P.last_msg[0] = 0;
+    if (access("/usr/bin/nmcli", X_OK) && access("/bin/nmcli", X_OK)) {
+        P.last_ok = 0;
+        snprintf(P.last_msg, sizeof P.last_msg, "no nmcli");
         return 0;
     }
+    if (rescan)
+        (void)!system("nmcli -w 8 device wifi rescan >/dev/null 2>&1");
     p = popen("nmcli -t -f SSID,BSSID,SIGNAL,SECURITY device wifi list 2>/dev/null", "r");
     if (!p) {
-        pet.last_ok = 0;
-        snprintf(pet.last_msg, sizeof pet.last_msg, "wifi quiet");
+        P.last_ok = 0;
+        snprintf(P.last_msg, sizeof P.last_msg, "wifi quiet");
         return 0;
     }
     while (fgets(line, sizeof line, p)) {
-        char ssid[64] = "", bssid[32] = "", sec[40] = "", extra[96], key[80];
-        char *s, *parts[6];
-        int np = 0, sig = 0, is_open, is_wpa3;
+        char *part[5], *s = line, key[80], extra[96];
+        int np = 0, is_open, is_wpa3, is_new;
+        Net *r;
         line[strcspn(line, "\n")] = 0;
         if (!line[0] || !strncmp(line, "Error", 5))
             continue;
-        s = line;
-        while (np < 5) {
-            parts[np++] = s;
+        while (np < 4) {
+            part[np++] = s;
             s = strchr(s, ':');
             if (!s)
                 break;
@@ -254,224 +232,197 @@ static int scan_wifi(int *new_ssid, int *opens, int *wpa3)
         }
         if (np < 3)
             continue;
-        snprintf(ssid, sizeof ssid, "%s", parts[0][0] ? parts[0] : "<Hidden>");
-        snprintf(bssid, sizeof bssid, "%s", parts[1]);
-        sig = atoi(parts[2]);
-        if (np >= 4)
-            snprintf(sec, sizeof sec, "%s", parts[3][0] ? parts[3] : "Open");
-        else
-            snprintf(sec, sizeof sec, "Open");
-        snprintf(key, sizeof key, "%s|%s", ssid, bssid);
-        is_open = (!sec[0] || !strcmp(sec, "--") || !strcasecmp(sec, "open") || !strcasecmp(sec, "none"));
-        is_wpa3 = strstr(sec, "WPA3") || strstr(sec, "wpa3");
+        r = &rows[nrows];
+        memset(r, 0, sizeof *r);
+        snprintf(r->ssid, sizeof r->ssid, "%s", part[0][0] ? part[0] : "<Hidden>");
+        snprintf(r->bssid, sizeof r->bssid, "%s", part[1]);
+        r->sig = atoi(part[2]);
+        snprintf(r->sec, sizeof r->sec, "%s", np >= 4 && part[3][0] ? part[3] : "Open");
+        snprintf(key, sizeof key, "%s|%s", r->ssid, r->bssid);
+        is_open = !r->sec[0] || !strcmp(r->sec, "--") || !strcasecmp(r->sec, "open");
+        is_wpa3 = !!strstr(r->sec, "WPA3") || !!strstr(r->sec, "wpa3");
+        is_new = !known(Ssid, &nSsid, MAX_SSID, key);
+        r->is_new = is_new;
         if (is_open)
-            (*opens)++;
+            op++;
         if (is_wpa3)
-            (*wpa3)++;
-        if (!seen_key(ssids, &nssid, MAX_SSID, key)) {
-            (*new_ssid)++;
-            snprintf(extra, sizeof extra, "%d %s %s", sig, sec, bssid);
-            log_append("SSID", ssid, extra);
+            w3++;
+        if (is_new) {
+            neu++;
+            snprintf(extra, sizeof extra, "%d %s %s", r->sig, r->sec, r->bssid);
+            log_line("SSID", r->ssid, extra);
         }
+        if (nrows < MAX_ROW - 1)
+            nrows++;
         n++;
-        if (n > 64)
-            break;
     }
     pclose(p);
-    /* best-effort rescan for next time */
-    if (n == 0)
-        (void)system("nmcli device wifi rescan >/dev/null 2>&1");
+    P.last_n = n;
+    P.opens += (unsigned)op;
+    P.wpa3 += (unsigned)w3;
+    if (!P.last_ok || n == 0) {
+        P.mood = M_BOR;
+        P.bor += 10;
+        if (P.bor > 100)
+            P.bor = 100;
+        P.exc -= 6;
+        if (P.exc < 0)
+            P.exc = 0;
+    } else if (neu > 3) {
+        P.mood = M_EXC;
+        P.exc += 20;
+        if (P.exc > 100)
+            P.exc = 100;
+        P.bor -= 18;
+        if (P.bor < 0)
+            P.bor = 0;
+        P.wow++;
+    } else if (op > 0) {
+        P.mood = M_SUR;
+        P.exc += 12;
+        if (P.exc > 100)
+            P.exc = 100;
+    } else if (neu > 0) {
+        P.mood = M_CUR;
+        P.bor -= 8;
+        if (P.bor < 0)
+            P.bor = 0;
+    } else if (P.bor > 60)
+        P.mood = M_BOR;
+    else
+        P.mood = (n % 2) ? M_HAP : M_COO;
+    snprintf(status, sizeof status, "scan %d  new %d  open %d", n, neu, op);
     return n;
 }
 
-static void observe(void)
+static void observe(int rescan)
 {
-    int neu, op, w3, n;
-    tick_time();
-    pet.scans++;
-    n = scan_wifi(&neu, &op, &w3);
+    tick();
+    P.scans++;
+    scan_wifi(rescan);
     capture_ips();
-    pet.last_n = n;
-    pet.seen += (unsigned)n;
-    pet.opens += (unsigned)op;
-    pet.wpa3 += (unsigned)w3;
-    if (!pet.last_ok || n == 0) {
-        pet.mood = M_BORED;
-        pet.boredom += 12;
-        if (pet.boredom > 100)
-            pet.boredom = 100;
-        pet.excitement -= 8;
-        if (pet.excitement < 0)
-            pet.excitement = 0;
-    } else if (neu > 3) {
-        pet.mood = M_EXCITED;
-        pet.excitement += 25;
-        if (pet.excitement > 100)
-            pet.excitement = 100;
-        pet.boredom -= 20;
-        if (pet.boredom < 0)
-            pet.boredom = 0;
-        pet.wow++;
-    } else if (op > 0) {
-        pet.mood = M_SURPRISED;
-        pet.excitement += 15;
-        if (pet.excitement > 100)
-            pet.excitement = 100;
-    } else if (neu > 0) {
-        pet.mood = M_CURIOUS;
-        pet.boredom -= 10;
-        if (pet.boredom < 0)
-            pet.boredom = 0;
-    } else if (pet.boredom > 60)
-        pet.mood = M_BORED;
-    else
-        pet.mood = (int)(time(NULL) % 3 == 0 ? M_HAPPY : M_COOL);
     pet_save();
-}
-
-static const char *mood_name(void)
-{
-    static const char *n[] = {"curious", "happy", "excited", "bored", "surprised", "cool"};
-    return n[pet.mood < M_N ? pet.mood : 0];
+    dirty = 1;
 }
 
 static const char *face(void)
 {
-    if (pet.energy < 20)
-        return FACES[5];
-    if (pet.excitement > 75)
-        return FACES[2];
-    if (pet.boredom > 70)
-        return FACES[3];
-    if (pet.mood == M_SURPRISED)
-        return FACES[4];
-    if (pet.mood == M_HAPPY || pet.mood == M_EXCITED)
-        return FACES[2];
-    if (pet.mood == M_BORED)
-        return FACES[3];
-    return FACES[1];
+    if (P.en < 20)
+        return "(-_-)z";
+    if (P.exc > 75)
+        return "(^_^)";
+    if (P.bor > 70)
+        return "(-_-)";
+    if (P.mood == M_SUR)
+        return "(O_O)";
+    if (P.mood == M_EXC || P.mood == M_HAP)
+        return "(^_^)";
+    if (P.mood == M_COO)
+        return "(._.)";
+    return "(o_o)";
+}
+
+static const char *moodn(void)
+{
+    static const char *n[] = {"curious", "happy", "excited", "bored", "surprised", "cool"};
+    return n[P.mood > 5 ? 0 : P.mood];
 }
 
 static const char *speak(void)
 {
-    if (!pet.last_ok)
-        return "The air is quiet. Or nmcli is napping.";
-    if (pet.mood == M_EXCITED)
-        return "New signals. I like this block.";
-    if (pet.mood == M_BORED)
-        return "Same old nets. Take me somewhere else.";
-    if (pet.mood == M_SURPRISED)
-        return "Open network. Unexpected.";
-    if (pet.mood == M_HAPPY)
-        return "The airwaves feel friendly.";
-    if (pet.mood == M_COOL)
-        return "Stay curious.";
-    return "The spectrum is full of secrets.";
+    if (!P.last_ok)
+        return "Radio quiet. Sitting still.";
+    if (P.mood == M_EXC)
+        return "New signals on this block.";
+    if (P.mood == M_BOR)
+        return "Same nets. Walk somewhere.";
+    if (P.mood == M_SUR)
+        return "Open AP. Noted.";
+    if (P.mood == M_HAP)
+        return "Airwaves feel friendly.";
+    return "Spectrum has secrets.";
 }
 
-static void bar(char *out, int n, float pct)
+static void bar(char *o, int n, float p)
 {
-    int i, k = (int)(pct / 100.f * n + 0.5f);
+    int i, k = (int)(p / 100.f * n + 0.5f);
     if (k < 0)
         k = 0;
     if (k > n)
         k = n;
     for (i = 0; i < n; i++)
-        out[i] = i < k ? '#' : '-';
-    out[n] = 0;
+        o[i] = (char)(i < k ? '#' : '-');
+    o[n] = 0;
 }
 
-static void clip(char *dst, const char *s)
+static void putbar(int y, const char *lab, float v)
 {
-    snprintf(dst, COLS + 1, "%s", s);
-    if ((int)strlen(dst) > COLS)
-        dst[COLS - 1] = '~', dst[COLS] = 0;
+    char b[12];
+    bar(b, 10, v);
+    mvprintw(y, 0, "%s %s %3.0f", lab, b, v);
+}
+
+static int prompt(const char *title, char *out, size_t n)
+{
+    echo();
+    curs_set(1);
+    mvprintw(LINES / 2, 2, "%s: ", title);
+    clrtoeol();
+    out[0] = 0;
+    wgetnstr(stdscr, out, (int)n - 1);
+    noecho();
+    curs_set(0);
+    return out[0] != 0;
 }
 
 static void draw(void)
 {
-    char b1[16], b2[16], b3[16], line[64];
-    int i;
-    bar(b1, 10, pet.boredom);
-    bar(b2, 10, pet.excitement);
-    bar(b3, 10, pet.energy);
-    fwrite("\033[H\033[J", 1, 6, stdout);
-    puts("+----------------------------------------------+");
-    snprintf(line, sizeof line, "cGotchi %s", face());
-    printf("|%-46s|\n", line);
-    puts("+----------------------------------------------+");
-    printf("%s  %.1fd  %s\n", pet.name, pet.age_h / 24.f, mood_name());
-    printf("bor %s %3.0f\n", b1, pet.boredom);
-    printf("exc %s %3.0f\n", b2, pet.excitement);
-    printf("en  %s %3.0f\n", b3, pet.energy);
-    puts("-----------------------------------------------");
-    printf("scan %u  ssid %d  ip %d\n", pet.scans, nssid, nip);
-    printf("open %u  wpa3 %u  wow %u\n", pet.opens, pet.wpa3, pet.wow);
-    if (pet.last_ok)
-        printf("last %d nets\n", pet.last_n);
-    else
-        printf("scan fail: %s\n", pet.last_msg);
-    puts("-----------------------------------------------");
-    clip(line, speak());
-    puts(line);
-    puts("-----------------------------------------------");
-    printf("[s]can [a]uto%s [l]og [q]uit\n", autoscan ? "*" : "");
-    fflush(stdout);
-    (void)i;
-}
-
-static void show_log(void)
-{
-    FILE *f;
-    char lines[8][160];
-    int n = 0, i;
-    f = fopen(LOG_PATH, "r");
-    fwrite("\033[H\033[J", 1, 6, stdout);
-    puts("cGotchi log  /home/working/ogotchi_log.txt");
-    puts("-----------------------------------------------");
-    if (!f) {
-        puts("(empty or unreadable)");
-        puts("[any key]");
+    int h, w, mid, list_h, i, y;
+    if (!dirty)
         return;
+    getmaxyx(stdscr, h, w);
+    mid = w * 3 / 5;
+    if (mid < 24)
+        mid = w / 2;
+    erase();
+    attron(A_REVERSE);
+    mvprintw(0, 0, "%-*s", w, "");
+    mvprintw(0, 1, "cGotchi %s  %s  %.1fd  auto%s", face(), moodn(), P.age_h / 24.f, P.auto_on ? "*" : "-");
+    attroff(A_REVERSE);
+    mvprintw(1, 1, "%s", P.name);
+    putbar(2, "bor", P.bor);
+    putbar(3, "exc", P.exc);
+    putbar(4, "en ", P.en);
+    mvprintw(5, 1, "scan %u  ssid %d  ip %d  wow %u", P.scans, nSsid, nIp, P.wow);
+    mvprintw(6, 1, "%s", speak());
+    mvprintw(7, 0, "scan");
+    mvprintw(7, mid + 1, "addr");
+    list_h = h - 10;
+    if (list_h < 3)
+        list_h = 3;
+    y = 8;
+    for (i = 0; i < nrows && i < list_h; i++) {
+        if (P.hide_open && (!strcmp(rows[i].sec, "Open") || !rows[i].sec[0]))
+            continue;
+        mvprintw(y, 0, "%c%-14.14s %3d %-6.6s", rows[i].is_new ? '*' : ' ',
+                 rows[i].ssid, rows[i].sig, rows[i].sec);
+        y++;
+        if (y >= h - 2)
+            break;
     }
-    while (fgets(lines[n % 8], sizeof lines[0], f))
-        n++;
-    fclose(f);
-    {
-        int start = n > 8 ? n - 8 : 0;
-        int shown = n > 8 ? 8 : n;
-        /* last 8 lines: if n>=8 they sit at n%8 start */
-        if (n <= 8)
-            for (i = 0; i < n; i++)
-                fputs(lines[i], stdout);
-        else {
-            int idx = n % 8;
-            for (i = 0; i < 8; i++)
-                fputs(lines[(idx + i) % 8], stdout);
-        }
-        (void)start;
-        (void)shown;
+    y = 8;
+    for (i = 0; i < nIp && y < h - 2; i++) {
+        mvprintw(y, mid + 1, "%-18.18s", Ips[i].k);
+        y++;
     }
-    puts("-----------------------------------------------");
-    puts("[any key]");
-    fflush(stdout);
-}
-
-static void raw(int on)
-{
-    struct termios t;
-    if (on) {
-        tcgetattr(0, &oldt);
-        t = oldt;
-        t.c_lflag &= ~(ICANON | ECHO);
-        t.c_cc[VMIN] = 0;
-        t.c_cc[VTIME] = 0;
-        tcsetattr(0, TCSANOW, &t);
-        raw_on = 1;
-    } else if (raw_on) {
-        tcsetattr(0, TCSANOW, &oldt);
-        raw_on = 0;
-    }
+    if (0 < mid && mid < w)
+        mvvline(7, mid, ACS_VLINE, h - 9);
+    attron(A_REVERSE);
+    mvprintw(h - 2, 0, "%-*s", w, status[0] ? status : LOG_PATH);
+    mvprintw(h - 1, 0, "%-*s", w, "s scan  R rescan  a auto  n name  o open  q");
+    attroff(A_REVERSE);
+    refresh();
+    dirty = 0;
 }
 
 int main(void)
@@ -480,37 +431,55 @@ int main(void)
     pet_load();
     log_preload();
     capture_ips();
-    raw(1);
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(0);
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+    }
+    snprintf(status, sizeof status, "s to look around");
+    dirty = 1;
     draw();
     for (;;) {
-        int pr = poll(&pfd, 1, autoscan ? 25000 : 400);
-        if (pr > 0) {
-            unsigned char ch = 0;
-            if (read(0, &ch, 1) != 1)
-                continue;
-            if (ch == 'q' || ch == 'Q')
+        int timeout = P.auto_on ? 25000 : 200;
+        if (poll(&pfd, 1, timeout) > 0) {
+            int k = getch();
+            if (k == 'q' || k == 'Q')
                 break;
-            if (ch == 's' || ch == 'S') {
-                observe();
-                draw();
-            } else if (ch == 'a' || ch == 'A') {
-                autoscan ^= 1;
-                draw();
-            } else if (ch == 'l' || ch == 'L') {
-                show_log();
-                poll(&pfd, 1, 8000);
-                if (pfd.revents & POLLIN) {
-                    unsigned char d;
-                    read(0, &d, 1);
+            if (k == 's')
+                observe(0);
+            else if (k == 'R')
+                observe(1);
+            else if (k == 'a' || k == 'A') {
+                P.auto_on ^= 1;
+                pet_save();
+                snprintf(status, sizeof status, P.auto_on ? "auto on" : "auto off");
+                dirty = 1;
+            } else if (k == 'n' || k == 'N') {
+                char nm[24];
+                if (prompt("name", nm, sizeof nm)) {
+                    snprintf(P.name, sizeof P.name, "%s", nm);
+                    pet_save();
                 }
-                draw();
-            }
-        } else if (autoscan) {
-            observe();
-            draw();
-        }
+                dirty = 1;
+            } else if (k == 'o' || k == 'O') {
+                P.hide_open ^= 1;
+                snprintf(status, sizeof status, P.hide_open ? "hide open" : "show open");
+                dirty = 1;
+            } else if (k == 'i' || k == 'I') {
+                capture_ips();
+                snprintf(status, sizeof status, "ips %d", nIp);
+                dirty = 1;
+            } else if (k == KEY_RESIZE)
+                dirty = 1;
+        } else if (P.auto_on)
+            observe(0);
+        draw();
     }
-    raw(0);
+    endwin();
     pet_save();
     return 0;
 }
