@@ -15,6 +15,7 @@
 #define MAX_SSID 1024
 #define MAX_IP 256
 #define MAX_ROW 48
+#define MAX_RADIO 12
 #define AGE_OUT 3
 
 enum { M_CUR, M_HAP, M_EXC, M_BOR, M_SUR, M_COO };
@@ -27,10 +28,11 @@ typedef struct {
     unsigned scans, opens, wpa3, wow;
     int last_n, last_ok;
     char last_msg[40];
+    char radio[32]; /* "" = default NM radio, "*" = all wifi ifaces */
 } Pet;
 
 typedef struct {
-    char ssid[48], bssid[24], sec[20], freq[12];
+    char ssid[48], bssid[24], sec[20], freq[12], radio[16];
     int sig, is_new;
     unsigned seen;
 } Net;
@@ -39,11 +41,18 @@ typedef struct {
     char k[80];
 } Slot;
 
+typedef struct {
+    char name[16];
+    char state[24];
+} Radio;
+
 static Pet P;
 static Slot Ssid[MAX_SSID], Ips[MAX_IP];
 static int nSsid, nIp;
 static Net rows[MAX_ROW];
 static int nrows;
+static Radio radios[MAX_RADIO];
+static int nradio;
 static char status[80];
 static int dirty = 1, cur, show_log;
 
@@ -76,6 +85,7 @@ static void pet_default(void)
     P.en = 80;
     P.mood = M_CUR;
     P.last_ok = 1;
+    P.radio[0] = 0;
 }
 
 static void pet_save(void)
@@ -87,16 +97,17 @@ static void pet_save(void)
     f = fopen(tmp, "w");
     if (!f)
         return;
-    fprintf(f, "%s\n%ld %ld\n%.3f %.1f %.1f %.1f\n%d %d\n%u %u %u %u\n",
+    fprintf(f, "%s\n%ld %ld\n%.3f %.1f %.1f %.1f\n%d %d\n%u %u %u %u\n%s\n",
             P.name, (long)P.born, (long)P.last, P.age_h, P.bor, P.exc, P.en,
-            P.mood, P.auto_on, P.scans, P.opens, P.wpa3, P.wow);
+            P.mood, P.auto_on, P.scans, P.opens, P.wpa3, P.wow,
+            P.radio[0] ? P.radio : "-");
     fclose(f);
     rename(tmp, path);
 }
 
 static void pet_load(void)
 {
-    char path[256];
+    char path[256], rad[40];
     FILE *f;
     long b, l;
     pet_default();
@@ -119,6 +130,8 @@ static void pet_load(void)
         P.mood = M_CUR;
     if (fscanf(f, "%u %u %u %u", &P.scans, &P.opens, &P.wpa3, &P.wow) != 4) {
     }
+    if (fscanf(f, " %39s", rad) == 1 && strcmp(rad, "-"))
+        snprintf(P.radio, sizeof P.radio, "%s", rad);
     fclose(f);
 }
 
@@ -246,26 +259,65 @@ static void age_rows(void)
     nrows = o;
 }
 
-static int scan_wifi(int rescan)
+static int refresh_radios(void)
 {
     FILE *p;
-    char line[512];
-    int n = 0, neu = 0, op = 0, w3 = 0;
-    P.last_ok = 1;
-    P.last_msg[0] = 0;
-    if (access("/usr/bin/nmcli", X_OK) && access("/bin/nmcli", X_OK)) {
-        P.last_ok = 0;
-        snprintf(P.last_msg, sizeof P.last_msg, "no nmcli");
+    char line[128];
+    nradio = 0;
+    p = popen("nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null", "r");
+    if (!p)
         return 0;
+    while (fgets(line, sizeof line, p) && nradio < MAX_RADIO) {
+        char *f[4];
+        int nf;
+        line[strcspn(line, "\n")] = 0;
+        nf = split_g(line, f, 3);
+        if (nf < 2)
+            continue;
+        if (strcmp(f[1], "wifi") && strcmp(f[1], "wifi-p2p"))
+            continue;
+        snprintf(radios[nradio].name, sizeof radios[0].name, "%s", f[0]);
+        snprintf(radios[nradio].state, sizeof radios[0].state, "%s",
+                 nf >= 3 ? f[2] : "");
+        nradio++;
     }
-    if (rescan)
-        (void)!system("nmcli -w 8 device wifi rescan >/dev/null 2>&1");
-    p = popen("nmcli -g SSID,BSSID,SIGNAL,SECURITY,FREQ device wifi list 2>/dev/null", "r");
-    if (!p) {
-        P.last_ok = 0;
-        snprintf(P.last_msg, sizeof P.last_msg, "wifi quiet");
+    pclose(p);
+    return nradio;
+}
+
+static const char *radio_label(void)
+{
+    if (!P.radio[0])
+        return "auto";
+    if (!strcmp(P.radio, "*"))
+        return "ALL";
+    return P.radio;
+}
+
+static int scan_one(const char *iface, int rescan, int *neu, int *op, int *w3)
+{
+    FILE *p;
+    char cmd[256], line[512];
+    int n = 0;
+    if (iface && iface[0] && strcmp(iface, "*")) {
+        if (rescan) {
+            snprintf(cmd, sizeof cmd,
+                     "nmcli -w 8 device wifi rescan ifname %s >/dev/null 2>&1",
+                     iface);
+            (void)!system(cmd);
+        }
+        snprintf(cmd, sizeof cmd,
+                 "nmcli -g SSID,BSSID,SIGNAL,SECURITY,FREQ device wifi list ifname %s 2>/dev/null",
+                 iface);
+    } else {
+        if (rescan)
+            (void)!system("nmcli -w 8 device wifi rescan >/dev/null 2>&1");
+        snprintf(cmd, sizeof cmd,
+                 "nmcli -g SSID,BSSID,SIGNAL,SECURITY,FREQ device wifi list 2>/dev/null");
+    }
+    p = popen(cmd, "r");
+    if (!p)
         return 0;
-    }
     while (fgets(line, sizeof line, p)) {
         char *f[6], key[40], extra[96];
         int nf, hidden, is_open, is_wpa3, is_new;
@@ -283,6 +335,8 @@ static int scan_wifi(int rescan)
         tmp.sig = atoi(f[2]);
         snprintf(tmp.sec, sizeof tmp.sec, "%s", nf >= 4 && f[3][0] ? f[3] : "Open");
         snprintf(tmp.freq, sizeof tmp.freq, "%s", nf >= 5 ? f[4] : "");
+        snprintf(tmp.radio, sizeof tmp.radio, "%s",
+                 iface && iface[0] && strcmp(iface, "*") ? iface : "");
         tmp.seen = P.scans;
         snprintf(key, sizeof key, "%s", tmp.bssid[0] ? tmp.bssid : tmp.ssid);
         is_open = !tmp.sec[0] || !strcmp(tmp.sec, "--") || !strcasecmp(tmp.sec, "open");
@@ -290,22 +344,52 @@ static int scan_wifi(int rescan)
         is_new = !known(Ssid, &nSsid, MAX_SSID, key);
         tmp.is_new = is_new;
         if (is_open)
-            op++;
+            (*op)++;
         if (is_wpa3)
-            w3++;
+            (*w3)++;
         if (is_new) {
-            neu++;
-            snprintf(extra, sizeof extra, "%d %s %s %s", tmp.sig, tmp.sec, tmp.freq, tmp.bssid);
+            (*neu)++;
+            snprintf(extra, sizeof extra, "%d %s %s %s %s", tmp.sig, tmp.sec,
+                     tmp.freq, tmp.bssid, tmp.radio);
             log_line("SSID", hidden ? tmp.bssid : tmp.ssid, extra);
         }
         r = tmp.bssid[0] ? find_bssid(tmp.bssid) : NULL;
-        if (r)
-            *r = tmp;
-        else if (nrows < MAX_ROW)
+        if (r) {
+            if (tmp.sig > r->sig || !r->radio[0])
+                *r = tmp;
+            else
+                r->seen = tmp.seen;
+        } else if (nrows < MAX_ROW)
             rows[nrows++] = tmp;
         n++;
     }
     pclose(p);
+    return n;
+}
+
+static int scan_wifi(int rescan)
+{
+    int n = 0, neu = 0, op = 0, w3 = 0, i;
+    P.last_ok = 1;
+    P.last_msg[0] = 0;
+    if (access("/usr/bin/nmcli", X_OK) && access("/bin/nmcli", X_OK)) {
+        P.last_ok = 0;
+        snprintf(P.last_msg, sizeof P.last_msg, "no nmcli");
+        return 0;
+    }
+    refresh_radios();
+    if (!strcmp(P.radio, "*")) {
+        if (!nradio) {
+            n = scan_one(NULL, rescan, &neu, &op, &w3);
+        } else {
+            for (i = 0; i < nradio; i++)
+                n += scan_one(radios[i].name, rescan, &neu, &op, &w3);
+        }
+    } else if (P.radio[0]) {
+        n = scan_one(P.radio, rescan, &neu, &op, &w3);
+    } else {
+        n = scan_one(NULL, rescan, &neu, &op, &w3);
+    }
     age_rows();
     qsort(rows, (size_t)nrows, sizeof(Net), cmp_sig);
     if (cur >= nrows)
@@ -344,7 +428,8 @@ static int scan_wifi(int rescan)
         P.mood = M_BOR;
     else
         P.mood = (n % 2) ? M_HAP : M_COO;
-    snprintf(status, sizeof status, "scan %d  new %d  open %d", n, neu, op);
+    snprintf(status, sizeof status, "%s  scan %d  new %d  open %d",
+             radio_label(), n, neu, op);
     return n;
 }
 
@@ -452,6 +537,60 @@ static int prompt(const char *title, char *out, size_t n)
     return out[0] != 0;
 }
 
+static void pick_radio(void)
+{
+    int h, w, i, sel = 0, total, k;
+    refresh_radios();
+    total = nradio + 2; /* 0=auto, 1=ALL, then ifaces */
+    if (!strcmp(P.radio, "*"))
+        sel = 1;
+    else if (P.radio[0]) {
+        for (i = 0; i < nradio; i++)
+            if (!strcmp(radios[i].name, P.radio))
+                sel = i + 2;
+    }
+    for (;;) {
+        getmaxyx(stdscr, h, w);
+        erase();
+        fill(0, 0, w, COLOR_PAIR(2));
+        put(0, 1, "radio  up/dn  enter  q", w - 3, COLOR_PAIR(2));
+        for (i = 0; i < total && i + 2 < h; i++) {
+            char buf[64];
+            int attr = (i == sel) ? COLOR_PAIR(2) : COLOR_PAIR(1);
+            if (i == 0)
+                snprintf(buf, sizeof buf, " auto   (nmcli default)");
+            else if (i == 1)
+                snprintf(buf, sizeof buf, " ALL    (%d wifi ifaces)", nradio);
+            else
+                snprintf(buf, sizeof buf, " %-8s %s", radios[i - 2].name,
+                         radios[i - 2].state);
+            put(i + 2, 1, buf, w - 2, attr);
+        }
+        if (!nradio)
+            put(h - 2, 1, "no wifi devices from nmcli", w - 3, COLOR_PAIR(3));
+        refresh();
+        k = getch();
+        if (k == 'q' || k == 'Q' || k == 27)
+            break;
+        if (k == KEY_UP && sel > 0)
+            sel--;
+        else if (k == KEY_DOWN && sel + 1 < total)
+            sel++;
+        else if (k == '\n' || k == KEY_ENTER || k == ' ') {
+            if (sel == 0)
+                P.radio[0] = 0;
+            else if (sel == 1)
+                snprintf(P.radio, sizeof P.radio, "*");
+            else
+                snprintf(P.radio, sizeof P.radio, "%s", radios[sel - 2].name);
+            pet_save();
+            snprintf(status, sizeof status, "radio %s", radio_label());
+            break;
+        }
+    }
+    dirty = 1;
+}
+
 static void draw(void)
 {
     int h, w, mid, lw, rw, list0, list_h, i, y;
@@ -479,7 +618,8 @@ static void draw(void)
     fill(0, 0, w, COLOR_PAIR(2));
     snprintf(buf, sizeof buf, "cGotchi %s", face());
     put(0, 1, buf, lw - 2, COLOR_PAIR(2));
-    snprintf(buf, sizeof buf, "%s %s", moodn(), P.auto_on ? "AUTO" : "");
+    snprintf(buf, sizeof buf, "%s %s %s", moodn(), P.auto_on ? "AUTO" : "",
+             radio_label());
     put(0, mid + 1, buf, rw, COLOR_PAIR(2));
 
     snprintf(buf, sizeof buf, "%s  %.1fd", P.name, P.age_h / 24.f);
@@ -504,8 +644,8 @@ static void draw(void)
         int attr = (i == cur) ? COLOR_PAIR(2) : (rows[i].is_new ? COLOR_PAIR(3) : COLOR_PAIR(1));
         if (P.hide_open && (!rows[i].sec[0] || !strcmp(rows[i].sec, "Open")))
             continue;
-        snprintf(buf, sizeof buf, "%c%-10.10s %3d", rows[i].is_new ? '*' : ' ',
-                 rows[i].ssid, rows[i].sig);
+        snprintf(buf, sizeof buf, "%c%-8.8s %3d %-5.5s", rows[i].is_new ? '*' : ' ',
+                 rows[i].ssid, rows[i].sig, rows[i].radio);
         put(y++, 0, buf, lw - 1, attr);
     }
     y = list0;
@@ -536,12 +676,13 @@ static void draw(void)
 
     fill(h - 2, 0, w, COLOR_PAIR(1));
     if (nrows && cur >= 0 && cur < nrows) {
-        snprintf(buf, sizeof buf, "%s  %s  %s", rows[cur].bssid, rows[cur].sec, rows[cur].freq);
+        snprintf(buf, sizeof buf, "%s  %s  %s  %s", rows[cur].bssid, rows[cur].sec,
+                 rows[cur].freq, rows[cur].radio);
         put(h - 2, 1, buf, w - 3, COLOR_PAIR(1));
     } else
         put(h - 2, 1, status[0] ? status : LOG_PATH, w - 3, COLOR_PAIR(1));
     fill(h - 1, 0, w, COLOR_PAIR(2));
-    put(h - 1, 1, "up/dn  s R  a  l log  n  o  q", w - 3, COLOR_PAIR(2));
+    put(h - 1, 1, "up/dn  s R  w radio  a  l log  n  o  q", w - 3, COLOR_PAIR(2));
     refresh();
     dirty = 0;
 }
@@ -552,6 +693,7 @@ int main(void)
     pet_load();
     log_preload();
     capture_ips();
+    refresh_radios();
     initscr();
     cbreak();
     noecho();
@@ -564,7 +706,7 @@ int main(void)
         init_pair(3, COLOR_YELLOW, COLOR_BLACK);
         bkgd(COLOR_PAIR(1));
     }
-    snprintf(status, sizeof status, "s look  R radio");
+    snprintf(status, sizeof status, "s look  R radio  w iface");
     dirty = 1;
     draw();
     for (;;) {
@@ -585,11 +727,12 @@ int main(void)
                 observe(0);
             else if (k == 'R')
                 observe(1);
+            else if (k == 'w' || k == 'W')
+                pick_radio();
             else if (k == 'l' || k == 'L') {
                 show_log ^= 1;
                 dirty = 1;
-            }
-            else if (k == 'a' || k == 'A') {
+            } else if (k == 'a' || k == 'A') {
                 P.auto_on ^= 1;
                 pet_save();
                 snprintf(status, sizeof status, P.auto_on ? "auto on" : "auto off");
