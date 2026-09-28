@@ -54,7 +54,76 @@ static int nrows;
 static Radio radios[MAX_RADIO];
 static int nradio;
 static char status[80];
-static int dirty = 1, cur, show_log;
+static int dirty = 1, cur, show_log, list_top;
+
+static int row_hidden(const Net *r)
+{
+    return P.hide_open && (!r->sec[0] || !strcmp(r->sec, "Open") || !strcmp(r->sec, "--"));
+}
+
+static int next_vis(int i)
+{
+    for (i++; i < nrows; i++)
+        if (!row_hidden(&rows[i]))
+            return i;
+    return -1;
+}
+
+static int prev_vis(int i)
+{
+    for (i--; i >= 0; i--)
+        if (!row_hidden(&rows[i]))
+            return i;
+    return -1;
+}
+
+static void ensure_cur_visible(int vis)
+{
+    int i, shown;
+    if (vis < 1)
+        vis = 1;
+    if (!nrows) {
+        list_top = 0;
+        cur = 0;
+        return;
+    }
+    if (cur < 0)
+        cur = 0;
+    if (cur >= nrows)
+        cur = nrows - 1;
+    if (row_hidden(&rows[cur])) {
+        i = next_vis(cur - 1);
+        if (i < 0)
+            i = prev_vis(cur);
+        if (i >= 0)
+            cur = i;
+    }
+    if (list_top < 0)
+        list_top = 0;
+    if (list_top > cur)
+        list_top = cur;
+    while (list_top < nrows && row_hidden(&rows[list_top]))
+        list_top++;
+    for (;;) {
+        shown = 0;
+        for (i = list_top; i < nrows && shown < vis; i++) {
+            if (row_hidden(&rows[i]))
+                continue;
+            if (i == cur)
+                return;
+            shown++;
+        }
+        if (list_top >= cur)
+            return;
+        list_top++;
+        while (list_top < nrows && row_hidden(&rows[list_top]))
+            list_top++;
+        if (list_top >= nrows) {
+            list_top = cur;
+            return;
+        }
+    }
+}
 
 static int known(Slot *t, int *n, int cap, const char *k)
 {
@@ -711,6 +780,7 @@ static void draw(void)
     list_h = h - list0;
     if (list_h < 1)
         list_h = 1;
+    ensure_cur_visible(list_h);
 
     erase();
     fill(0, 0, w, COLOR_PAIR(2));
@@ -738,10 +808,11 @@ static void draw(void)
     put(5, mid + 2, show_log ? "LOG" : "IP", 3, COLOR_PAIR(2));
 
     y = list0;
-    for (i = 0; i < nrows && y < list0 + list_h; i++) {
-        int attr = (i == cur) ? COLOR_PAIR(2) : (rows[i].is_new ? COLOR_PAIR(3) : COLOR_PAIR(1));
-        if (P.hide_open && (!rows[i].sec[0] || !strcmp(rows[i].sec, "Open")))
+    for (i = list_top; i < nrows && y < list0 + list_h; i++) {
+        int attr;
+        if (row_hidden(&rows[i]))
             continue;
+        attr = (i == cur) ? COLOR_PAIR(2) : (rows[i].is_new ? COLOR_PAIR(3) : COLOR_PAIR(1));
         snprintf(buf, sizeof buf, "%c%-8.8s %3d %-5.5s", rows[i].is_new ? '*' : ' ',
                  rows[i].ssid, rows[i].sig, rows[i].radio);
         put(y++, 0, buf, lw - 1, attr);
@@ -802,15 +873,18 @@ int main(void)
         int timeout = P.auto_on ? 25000 : 500;
         if (poll(&pfd, 1, timeout) > 0) {
             int k = getch();
+            int i;
             if (k == 'q' || k == 'Q')
                 break;
             if (k == KEY_UP) {
-                if (cur > 0)
-                    cur--;
+                i = prev_vis(cur);
+                if (i >= 0)
+                    cur = i;
                 dirty = 1;
             } else if (k == KEY_DOWN) {
-                if (cur + 1 < nrows)
-                    cur++;
+                i = next_vis(cur);
+                if (i >= 0)
+                    cur = i;
                 dirty = 1;
             } else if (k == 's')
                 observe(0);
