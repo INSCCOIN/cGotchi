@@ -537,6 +537,104 @@ static int prompt(const char *title, char *out, size_t n)
     return out[0] != 0;
 }
 
+static int chan_from_freq(const char *freq)
+{
+    int mhz = atoi(freq);
+    if (mhz >= 2412 && mhz <= 2484)
+        return mhz == 2484 ? 14 : (mhz - 2407) / 5;
+    if (mhz >= 5000 && mhz <= 5895)
+        return (mhz - 5000) / 5;
+    return 0;
+}
+
+static const char *band_from_freq(const char *freq)
+{
+    int mhz = atoi(freq);
+    if (mhz >= 2400 && mhz < 2500)
+        return "2.4 GHz";
+    if (mhz >= 5000 && mhz < 5900)
+        return "5 GHz";
+    if (mhz >= 5900 && mhz < 7200)
+        return "6 GHz";
+    return "?";
+}
+
+static void show_help(void)
+{
+    static const char *lines[] = {
+        "h        this help",
+        "enter    AP info for highlighted SSID",
+        "s        scan (current radio)",
+        "R        force radio rescan then list",
+        "w        pick radio: auto / ALL / iface",
+        "up/down  move AP highlight",
+        "a        toggle auto-scan",
+        "l        toggle log / IP pane",
+        "n        rename pet",
+        "o        hide or show open APs",
+        "i        refresh local IPv4 list",
+        "q        quit",
+        "",
+        "any key closes",
+        NULL
+    };
+    int h, w, i;
+    getmaxyx(stdscr, h, w);
+    erase();
+    fill(0, 0, w, COLOR_PAIR(2));
+    put(0, 1, "HELP", w - 2, COLOR_PAIR(2));
+    for (i = 0; lines[i] && i + 2 < h; i++)
+        put(i + 2, 2, lines[i], w - 4, COLOR_PAIR(1));
+    refresh();
+    getch();
+    dirty = 1;
+}
+
+static void show_info(void)
+{
+    const Net *r;
+    int h, w, ch, y = 2;
+    char buf[96];
+    if (!nrows || cur < 0 || cur >= nrows)
+        return;
+    r = &rows[cur];
+    ch = chan_from_freq(r->freq);
+    getmaxyx(stdscr, h, w);
+    erase();
+    fill(0, 0, w, COLOR_PAIR(2));
+    put(0, 1, "INFO", w - 2, COLOR_PAIR(2));
+    snprintf(buf, sizeof buf, "SSID       %s", r->ssid);
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "BSSID      %s", r->bssid[0] ? r->bssid : "-");
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "signal     %d dBm", r->sig);
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "security   %s", r->sec[0] ? r->sec : "Open");
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "frequency  %s", r->freq[0] ? r->freq : "-");
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "band       %s", band_from_freq(r->freq));
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    if (ch)
+        snprintf(buf, sizeof buf, "channel    %d", ch);
+    else
+        snprintf(buf, sizeof buf, "channel    -");
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "radio      %s", r->radio[0] ? r->radio : radio_label());
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "first seen %s", r->is_new ? "this scan" : "known");
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "last scan  #%u", r->seen);
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    snprintf(buf, sizeof buf, "pet scans  %u", P.scans);
+    put(y++, 2, buf, w - 4, COLOR_PAIR(1));
+    if (y + 2 < h)
+        put(h - 1, 2, "any key closes", w - 4, COLOR_PAIR(1));
+    refresh();
+    getch();
+    dirty = 1;
+}
+
 static void pick_radio(void)
 {
     int h, w, i, sel = 0, total, k;
@@ -610,7 +708,7 @@ static void draw(void)
     if (rw < 8)
         rw = 8;
     list0 = 6;
-    list_h = h - list0 - 3;
+    list_h = h - list0;
     if (list_h < 1)
         list_h = 1;
 
@@ -674,15 +772,6 @@ static void draw(void)
     for (y = list0; y < list0 + list_h; y++)
         mvaddch(y, mid, ACS_VLINE | COLOR_PAIR(1));
 
-    fill(h - 2, 0, w, COLOR_PAIR(1));
-    if (nrows && cur >= 0 && cur < nrows) {
-        snprintf(buf, sizeof buf, "%s  %s  %s  %s", rows[cur].bssid, rows[cur].sec,
-                 rows[cur].freq, rows[cur].radio);
-        put(h - 2, 1, buf, w - 3, COLOR_PAIR(1));
-    } else
-        put(h - 2, 1, status[0] ? status : LOG_PATH, w - 3, COLOR_PAIR(1));
-    fill(h - 1, 0, w, COLOR_PAIR(2));
-    put(h - 1, 1, "up/dn  s R  w radio  a  l log  n  o  q", w - 3, COLOR_PAIR(2));
     refresh();
     dirty = 0;
 }
@@ -729,6 +818,10 @@ int main(void)
                 observe(1);
             else if (k == 'w' || k == 'W')
                 pick_radio();
+            else if (k == 'h' || k == 'H')
+                show_help();
+            else if (k == '\n' || k == KEY_ENTER)
+                show_info();
             else if (k == 'l' || k == 'L') {
                 show_log ^= 1;
                 dirty = 1;
